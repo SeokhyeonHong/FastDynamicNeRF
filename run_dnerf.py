@@ -19,48 +19,52 @@ np.random.seed(0)
 DEBUG = False
 
 def cache_raw(pts, viewdirs, time, u=None, v=None, w=None, beta=None, sigma=None, deform=None):
-    deform_res = deform.shape[0]
-    deform_indices = torch.floor((torch.clamp(time, 0., 1.) * (deform_res - 1))).view(-1).long() # [N_rays]
+    time_zeros = torch.eq(time, 0.)
+    
+    dir_res = beta.shape[0]
+    dir_theta = torch.acos(viewdirs[..., 2])
+    dir_phi = torch.atan2(viewdirs[..., 1], viewdirs[..., 0])
+    theta_indices = torch.round(dir_theta * dir_res / torch.pi) # [N_rays]
+    phi_indices = torch.round(dir_phi * dir_res / (2. * torch.pi)) # [N_rays]
+    dir_indices = torch.stack([theta_indices, phi_indices], -1) # [N_rays, 2]
+    dir_indices = torch.clamp(dir_indices, 0, dir_res - 1).long() # [N_rays, 2]
 
     point_res = u.shape[0]
-    latent_dim = u.shape[-1]
+    point_indices = torch.round((torch.clamp(pts, -4.0, 4.0) + 4.0) * point_res / 8.0) # [N_rays, Points, 3]
+    point_indices = torch.clamp(point_indices, 0, point_res - 1).long()
 
-    point_indices = torch.floor((torch.clamp(pts, -4.0, 4.0) + 4.0) * point_res / 8.0).long() # [N_rays, Points, 3]
-    point_indices = torch.clamp(point_indices, 0, point_res - 1)
-    deform_indices = deform_indices.expand(point_indices.shape[1], -1).transpose(0, 1).contiguous().view(-1) # [N_rays * Points]
-    point_indices = point_indices.view(-1, 3) # [N_rays * Points, 3]
-    pts_flat = pts.view(-1, 3) # [N_rays * Points, 3]
+    chunk = 1024*1024
+    raws = []
+    for i in range(0, pts.shape[0], chunk):
+        pts_query = point_indices[i:i+chunk] # [N_rays, N_points, 3]
+        sh = pts_query.shape
+        N_rays, N_points = sh[0], sh[1]
 
-    chunk = 1024*64
-    rgb_list, sigma_list = [], []
-    for i in range(0, point_indices.shape[0], chunk):
-        delta = deform[deform_indices[i:i+chunk], point_indices[i:i+chunk, 0], point_indices[i:i+chunk, 1], point_indices[i:i+chunk, 2]]
+        pts_query_flat = pts_query.view(-1, 3) # [N_rays * Points, 3]
+        deform_find = deform[pts_query_flat[:, 0], pts_query_flat[:, 1], pts_query_flat[:, 2]] # [N_rays * N_points, 3, 4]
+        deform_find = deform_find.view(N_rays, -1, 4) # [N_rays, N_points * 3, 4]
+
+        t = torch.cat([time[i:i+chunk]**3, time[i:i+chunk]**2, time[i:i+chunk], torch.ones_like(time[i:i+chunk])], -1)
+        t = t.view(N_rays, 1, 4) # [N_rays, 1, 4]
+        deform_find = (deform_find * t).sum(-1).view(-1, N_points, 3)
+        new_pts_query = pts[i:i+chunk] + deform_find
+        new_pts_query = torch.round((torch.clamp(new_pts_query, -4.0, 4.0) + 4.0) * point_res / 8.0) # [N_rays, N_points, 3]
+        new_pts_query = torch.clamp(new_pts_query, 0, point_res - 1).long() # [N_rays, N_points, 3]
+
+        x_query, y_query, z_query = new_pts_query[..., 0], new_pts_query[..., 1], new_pts_query[..., 2]
+        dir_query = dir_indices[i:i+chunk]
+
+        u_find = u[x_query, y_query, z_query].view(N_rays, N_points, -1) # [N_rays, N_points, dim]
+        v_find = v[x_query, y_query, z_query].view(N_rays, N_points, -1) # [N_rays, N_points, dim]
+        w_find = w[x_query, y_query, z_query].view(N_rays, N_points, -1) # [N_rays, N_points, dim]
+        sigma_find = sigma[x_query, y_query, z_query].view(N_rays, N_points) # [N_rays, N_points]
+        beta_find = beta[dir_query[:, 0], dir_query[:, 1]].view(N_rays, 1, -1) # [N_rays, 1, dim]
         
-        new_pts = delta + pts_flat[i:i+chunk]
-        new_pts_indices = torch.floor((torch.clamp(new_pts, -4.0, 4.0) + 4.0) * point_res / 8.0).long() # [N_rays * Points, 3]
-        new_pts_indices = new_pts_indices.view(-1, 3) # [N_rays * Points, 3]
-        new_pts_indices = torch.clamp(new_pts_indices, 0, point_res - 1)
-
-        u_find = u[new_pts_indices[:, 0], new_pts_indices[:, 1], new_pts_indices[:, 2]]
-        v_find = v[new_pts_indices[:, 0], new_pts_indices[:, 1], new_pts_indices[:, 2]]
-        w_find = w[new_pts_indices[:, 0], new_pts_indices[:, 1], new_pts_indices[:, 2]]
-
-        sigma_find = sigma[new_pts_indices[:, 0], new_pts_indices[:, 1], new_pts_indices[:, 2]]
-        beta_find = torch.ones_like(u_find)
-
-        r = (u_find * beta_find).sum(-1)
-        g = (v_find * beta_find).sum(-1)
-        b = (w_find * beta_find).sum(-1)
-
-        rgb_list.append(torch.stack([r, g, b], -1))
-        sigma_list.append(sigma_find)
-
-    rgb = torch.cat(rgb_list, 0)
-    sigma = torch.cat(sigma_list, 0)
-
-    raw = torch.cat([rgb, sigma], dim=1)
-    raw = raw.reshape(pts.shape[:-1] + (4,))
-    return raw, None, None
+        r = (u_find * beta_find).sum(-1) # [N_rays, N_points]
+        g = (v_find * beta_find).sum(-1) # [N_rays, N_points]
+        b = (w_find * beta_find).sum(-1) # [N_rays, N_points]
+        raws.append(torch.stack([r, g, b, sigma_find], -1)) # [N_rays, N_points, 4]
+    return torch.cat(raws, 0), None, None
 
 def cache_dirnet(resolution, kwargs):
     t = torch.linspace(0., 1., resolution)
@@ -81,12 +85,13 @@ def cache_dirnet(resolution, kwargs):
     net_fn = kwargs['network_query_fn']
     network_fn = kwargs['network_fn']
     betas = []
-    for i in range(0, resolution ** 2, chunk):
-        out, _, uvwb = net_fn(inputs=torch.zeros_like(dir[i:i+chunk,None,:]), viewdirs=dir[i:i+chunk], ts=torch.zeros_like(dir[i:i+chunk])[:,0:1], network_fn=network_fn)
-        
-        dim = uvwb.shape[-1] // 4
-        beta = uvwb[..., -dim:]
-        betas.append(beta)
+    with torch.no_grad():
+        for i in range(0, resolution ** 2, chunk):
+            out, _, uvwb = net_fn(inputs=torch.zeros_like(dir[i:i+chunk,None,:]), viewdirs=dir[i:i+chunk], ts=torch.zeros_like(dir[i:i+chunk])[:,0:1], network_fn=network_fn)
+            
+            dim = uvwb.shape[-1] // 4
+            beta = uvwb[..., -dim:]
+            betas.append(beta)
 
     betas = torch.cat(betas).reshape(resolution, resolution, -1)
     return betas
@@ -99,18 +104,19 @@ def cache_posnet(resolution, kwargs):
     box_max = torch.Tensor([4., 4., 4.]).to(device)
     points = box_min + xyz * (box_max - box_min)
 
-    chunk = 1024*32
+    chunk = 1024*64
     net_fn = kwargs['network_query_fn']
     network_fn = kwargs['network_fn']
     us, vs, ws, sigmas = [], [], [], []
-    for i in range(0, resolution ** 3, chunk):
-        out, _, uvwb = net_fn(points[i:i+chunk,None,:], viewdirs=torch.zeros_like(points[i:i+chunk]), ts=torch.zeros_like(points[i:i+chunk])[:,0:1], network_fn=network_fn)
-        
-        dim = uvwb.shape[-1] // 4
-        us.append(uvwb[..., 0:dim])
-        vs.append(uvwb[..., dim:2*dim])
-        ws.append(uvwb[..., 2*dim:3*dim])
-        sigmas.append(out[..., -1])
+    with torch.no_grad():
+        for i in range(0, resolution ** 3, chunk):
+            out, _, uvwb = net_fn(points[i:i+chunk,None,:], viewdirs=torch.zeros_like(points[i:i+chunk]), ts=torch.zeros_like(points[i:i+chunk])[:,0:1], network_fn=network_fn)
+            
+            dim = uvwb.shape[-1] // 4
+            us.append(uvwb[..., 0:dim])
+            vs.append(uvwb[..., dim:2*dim])
+            ws.append(uvwb[..., 2*dim:3*dim])
+            sigmas.append(out[..., -1])
 
     us = torch.cat(us).reshape(resolution, resolution, resolution, -1)
     vs = torch.cat(vs).reshape(resolution, resolution, resolution, -1)
@@ -119,24 +125,45 @@ def cache_posnet(resolution, kwargs):
     return us, vs, ws, sigmas
 
 def cache_deformnet(time_resolution, pos_resolution, kwargs):
-    t_time = torch.linspace(0., 1., time_resolution)
-    t_pos = torch.linspace(0., 1., pos_resolution)
-    xyz = torch.stack(torch.meshgrid([t_pos, t_pos, t_pos]), -1).view(-1, 3)
+    t = torch.linspace(0., 1., time_resolution)
+    p = torch.linspace(0., 1., pos_resolution)
+    xyz = torch.stack(torch.meshgrid([p, p, p]), -1).view(-1, 3)
     box_min = torch.Tensor([-4., -4., -4.]).to(device)
     box_max = torch.Tensor([4., 4., 4.]).to(device)
     points = box_min + xyz * (box_max - box_min)
 
-    chunk = 1024*32
+    chunk = 1024*1024
     net_fn = kwargs['network_query_fn']
     network_fn = kwargs['network_fn']
     deforms = []
-    for t in t_time:
+
+    for i in range(0, pos_resolution ** 3, chunk):
+        print(i)
         dxs = []
-        for i in range(0, pos_resolution ** 3, chunk):
-            _, dx, _ = net_fn(points[i:i+chunk,None,:], viewdirs=torch.zeros_like(points[i:i+chunk]), ts=torch.ones_like(points[i:i+chunk])[:,0:1] * t, network_fn=network_fn)
-            dxs.append(dx)
-        deforms.append(torch.cat(dxs).reshape(pos_resolution, pos_resolution, pos_resolution, -1))
-    deforms = torch.stack(deforms, 0)
+        with torch.no_grad():
+            for time in t:
+                _, dx, _ = net_fn(points[i:i+chunk,None,:], viewdirs=torch.zeros_like(points[i:i+chunk]), ts=torch.ones_like(points[i:i+chunk])[:,0:1] * time, network_fn=network_fn)
+                dxs.append(dx.squeeze())
+
+        dx_samples = torch.stack(dxs, -1)
+        gt_x = dx_samples[:, 0, :]
+        gt_y = dx_samples[:, 1, :]
+        gt_z = dx_samples[:, 2, :]
+
+        model = Cubic(chunk)
+        optim = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999))
+        time = torch.stack([t*t*t, t*t, t, torch.ones_like(t)])
+        for epoch in range(2000+1):
+            pred_x, pred_y, pred_z = model(time)
+            optim.zero_grad()
+            loss_x = F.mse_loss(pred_x, gt_x)
+            loss_y = F.mse_loss(pred_y, gt_y)
+            loss_z = F.mse_loss(pred_z, gt_z)
+            loss = loss_x + loss_y + loss_z
+            loss.backward()
+            optim.step()
+        deforms.append(torch.stack([model.x_coefficients.clone(), model.y_coefficients.clone(), model.z_coefficients.clone()], 1))
+    deforms = torch.cat(deforms, 0).reshape(pos_resolution, pos_resolution, pos_resolution, 3, -1)
     return deforms
 
 
@@ -311,14 +338,14 @@ def render_path(render_poses, render_times, hwf, chunk, render_kwargs, gt_imgs=N
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
 
-        if savedir is not None:
-            rgb8_estim = to8b(rgbs[-1])
-            filename = os.path.join(save_dir_estim, '{:03d}.png'.format(i+i_offset))
-            imageio.imwrite(filename, rgb8_estim)
-            if save_also_gt:
-                rgb8_gt = to8b(gt_imgs[i])
-                filename = os.path.join(save_dir_gt, '{:03d}.png'.format(i+i_offset))
-                imageio.imwrite(filename, rgb8_gt)
+        # if savedir is not None:
+        #     rgb8_estim = to8b(rgbs[-1])
+        #     filename = os.path.join(save_dir_estim, '{:03d}.png'.format(i+i_offset))
+        #     imageio.imwrite(filename, rgb8_estim)
+        #     if save_also_gt:
+        #         rgb8_gt = to8b(gt_imgs[i])
+        #         filename = os.path.join(save_dir_gt, '{:03d}.png'.format(i+i_offset))
+        #         imageio.imwrite(filename, rgb8_gt)
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
@@ -660,9 +687,9 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32, 
+    parser.add_argument("--chunk", type=int, default=1024*512,
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, 
+    parser.add_argument("--netchunk", type=int, default=1024*512, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -829,26 +856,28 @@ def train():
     render_times = torch.Tensor(render_times).to(device)
 
     if args.save_cache:
-        with torch.no_grad():
-            beta = cache_dirnet(256, render_kwargs_test)
-            u, v, w, sigma = cache_posnet(256, render_kwargs_test)
-            deform = cache_deformnet(16, 256, render_kwargs_test)
+        # with torch.no_grad():
+        cache_path = os.path.join(basedir, expname, 'cache/')
+        os.makedirs(cache_path, exist_ok=True)
+        
+        # beta = cache_dirnet(256, render_kwargs_test)
+        # torch.save(beta, os.path.join(cache_path, 'beta.pt'))
+        # print('Saved beta')
 
-            cache_path = os.path.join(basedir, expname, 'cache/')
-            os.makedirs(cache_path, exist_ok=True)
-            torch.save(beta, os.path.join(cache_path, 'beta.pt'))
-            print('Saved beta')
-            torch.save(sigma, os.path.join(cache_path, 'sigma.pt'))
-            print('Saved sigma')
-            torch.save(u, os.path.join(cache_path, 'u.pt'))
-            print('Saved u')
-            torch.save(v, os.path.join(cache_path, 'v.pt'))
-            print('Saved v')
-            torch.save(w, os.path.join(cache_path, 'w.pt'))
-            print('Saved w')
-            torch.save(deform, os.path.join(cache_path, 'deform.pt'))
-            print('Saved deform')
-            return
+        # u, v, w, sigma = cache_posnet(384, render_kwargs_test)
+        # torch.save(sigma, os.path.join(cache_path, 'sigma.pt'))
+        # print('Saved sigma')
+        # torch.save(u, os.path.join(cache_path, 'u.pt'))
+        # print('Saved u')
+        # torch.save(v, os.path.join(cache_path, 'v.pt'))
+        # print('Saved v')
+        # torch.save(w, os.path.join(cache_path, 'w.pt'))
+        # print('Saved w')
+
+        deform = cache_deformnet(16, 384, render_kwargs_test)
+        torch.save(deform, os.path.join(cache_path, 'deform.pt'))
+        print('Saved deform')
+        return
 
 
     # Short circuit if only rendering out from trained model
@@ -883,9 +912,9 @@ def train():
             print('test poses shape', render_poses.shape)
 
             rgbs, _ = render_path(render_poses, render_times, hwf, args.chunk, render_kwargs_test, gt_imgs=images,
-                                  savedir=testsavedir, render_factor=args.render_factor, save_also_gt=True, use_cache=args.use_cache)
+                                  savedir=testsavedir, render_factor=args.render_factor, save_also_gt=False, use_cache=args.use_cache)
             print('Done rendering', testsavedir)
-            imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+            # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
 

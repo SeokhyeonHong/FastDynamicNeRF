@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
@@ -277,6 +276,19 @@ class NeRFOriginal(nn.Module):
             outputs = self.output_linear(h)
 
         return outputs, torch.zeros_like(input_pts[:, :3]), torch.zeros_like(input_pts[:, :4*self.latent_dim])
+
+class Cubic(nn.Module):
+    def __init__(self, chunk):
+        super(Cubic, self).__init__()
+        self.x_coefficients = nn.Parameter(torch.rand(chunk, 4), requires_grad=True)
+        self.y_coefficients = nn.Parameter(torch.rand(chunk, 4), requires_grad=True)
+        self.z_coefficients = nn.Parameter(torch.rand(chunk, 4), requires_grad=True)
+
+    def forward(self, t):
+        x = self.x_coefficients.matmul(t)
+        y = self.y_coefficients.matmul(t)
+        z = self.z_coefficients.matmul(t)
+        return x, y, z
 
 def hsv_to_rgb(h, s, v):
     '''
